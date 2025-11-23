@@ -1,12 +1,12 @@
-# A4codes.py (DEBUG / TUNED VERSION WITH PRINTS)
+# A4codes.py
 #
 # COMP 3105 – Assignment 4
-# Two-stage ResNet18 model (no pretrained weights).
-# - Class model: in-domain classification
-# - Domain model: in-domain vs out-domain
+# Two-stage model using a small custom CNN (no pretrained weights).
+# - Class model: trained on in-domain data (10 classes)
+# - Domain model: trained to distinguish in-domain vs out-domain (2 classes)
 #
-# NOTE: THIS VERSION CONTAINS PRINT STATEMENTS FOR DEBUGGING.
-# Remove the prints before submission.
+# NOTE: This version includes DEBUG PRINTS so you can see training progress.
+# Remove print statements in learn() and _train_model() before submission.
 
 import os
 from typing import Dict, List, Tuple
@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from torchvision.models import resnet18
 from PIL import Image
 
 
@@ -65,16 +64,16 @@ class SimpleImageDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# Domain Dataset
+# Domain Dataset (in vs out)
 # -----------------------------------------------------------------------------
 
 class DomainDataset(Dataset):
     def __init__(self, in_root: str, out_root: str, transform=None):
         self.transform = transform
-        self.paths = []
-        self.domain_labels = []
+        self.paths: List[str] = []
+        self.domain_labels: List[int] = []
 
-        # in-domain -> label 0
+        # In-domain images → label 0
         for cname in os.listdir(in_root):
             cdir = os.path.join(in_root, cname)
             if not os.path.isdir(cdir):
@@ -85,7 +84,7 @@ class DomainDataset(Dataset):
                     self.paths.append(fpath)
                     self.domain_labels.append(0)
 
-        # out-domain -> label 1
+        # Out-domain images → label 1
         for cname in os.listdir(out_root):
             cdir = os.path.join(out_root, cname)
             if not os.path.isdir(cdir):
@@ -109,18 +108,46 @@ class DomainDataset(Dataset):
 
 
 # -----------------------------------------------------------------------------
-# ResNet18 Wrapper
+# Small CNN (much smaller than ResNet18)
 # -----------------------------------------------------------------------------
 
-class ResNet18Classifier(nn.Module):
+class SmallCNN(nn.Module):
     def __init__(self, num_classes: int):
         super().__init__()
-        self.model = resnet18(weights=None)
-        in_features = self.model.fc.in_features
-        self.model.fc = nn.Linear(in_features, num_classes)
+        # Input: 3 x 128 x 128
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),  # 32 x 128 x 128
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                             # 32 x 64 x 64
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1), # 64 x 64 x 64
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                             # 64 x 32 x 32
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),# 128 x 32 x 32
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                             # 128 x 16 x 16
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1), # 256 x 16 x 16
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1))                # 256 x 1 x 1
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),               # 256
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
 
     def forward(self, x):
-        return self.model(x)
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
 
 
 # -----------------------------------------------------------------------------
@@ -128,22 +155,17 @@ class ResNet18Classifier(nn.Module):
 # -----------------------------------------------------------------------------
 
 def _get_train_transform():
-    # Stronger augmentation to improve generalization
+    # Moderate augmentation: helps generalization but not too crazy
     return transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.Resize((140, 140)),
+        transforms.RandomCrop((128, 128)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1
-        ),
         transforms.ToTensor(),
     ])
 
 def _get_eval_transform():
     return transforms.Compose([
-        transforms.Resize((224, 224)),
+        transforms.Resize((128, 128)),
         transforms.ToTensor(),
     ])
 
@@ -153,16 +175,22 @@ def _make_dataloader(dataset, batch_size, shuffle):
 
 
 # -----------------------------------------------------------------------------
-# TRAINING LOOP (WITH PRINTS)
+# Training loop with debug prints
 # -----------------------------------------------------------------------------
 
-def _train_model(model, dataloader, device,
-                 num_epochs=50, lr=1e-3, weight_decay=1e-4, label=""):
+def _train_model(model: nn.Module,
+                 dataloader: DataLoader,
+                 device: torch.device,
+                 num_epochs: int,
+                 lr: float,
+                 weight_decay: float,
+                 label: str):
     model.to(device)
     model.train()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
     total_batches = len(dataloader)
     print(f"[DEBUG] --> Training {label}: {num_epochs} epochs, {total_batches} batches/epoch")
@@ -183,48 +211,50 @@ def _train_model(model, dataloader, device,
 
             running_loss += loss.item()
 
-            # Print 5 times per epoch
+            # Print ~5 times per epoch
             if batch_idx % max(1, total_batches // 5) == 0:
-                print(f"[DEBUG]     Batch {batch_idx}/{total_batches} - Loss: {loss.item():.4f}")
+                print(f"[DEBUG]       Batch {batch_idx}/{total_batches} - Loss: {loss.item():.4f}")
 
         avg_loss = running_loss / max(1, total_batches)
-        print(f"[DEBUG]   -> Epoch {epoch} complete. Avg loss = {avg_loss:.4f}\n")
+        print(f"[DEBUG]   -> Epoch {epoch} complete. Avg loss = {avg_loss:.4f}")
+        scheduler.step()
+        print(f"[DEBUG]      New LR: {scheduler.get_last_lr()[0]:.6f}\n")
 
 
 # -----------------------------------------------------------------------------
-# learn()  (WITH PRINTS)
+# learn()
 # -----------------------------------------------------------------------------
 
 def learn(path_to_in_domain: str, path_to_out_domain: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[DEBUG] Using device: {device}")
 
-    # 1. In-domain training set for class model
+    # 1. In-domain dataset for class model
     print("[DEBUG] Loading in-domain training data...")
     train_transform = _get_train_transform()
     in_train_ds = SimpleImageDataset(path_to_in_domain, transform=train_transform)
 
     class_to_idx = in_train_ds.class_to_idx
-    in_loader = _make_dataloader(in_train_ds, batch_size=32, shuffle=True)
     num_classes = len(class_to_idx)
+    in_loader = _make_dataloader(in_train_ds, batch_size=32, shuffle=True)
 
     print(f"[DEBUG] In-domain samples: {len(in_train_ds)}")
     print(f"[DEBUG] Number of classes: {num_classes}\n")
 
-    # 2. Train class model
+    # 2. Train class model (in-domain only)
     print("[DEBUG] Training class model...\n")
-    class_model = ResNet18Classifier(num_classes=num_classes)
+    class_model = SmallCNN(num_classes=num_classes)
     _train_model(
-        class_model,
-        in_loader,
-        device,
-        num_epochs=70,          # tuned: more epochs for better accuracy
-        lr=1e-3,
+        model=class_model,
+        dataloader=in_loader,
+        device=device,
+        num_epochs=80,          # tuned: enough to really learn
+        lr=0.01,
         weight_decay=1e-4,
         label="Class Model"
     )
 
-    # 3. Train domain model (in vs out)
+    # 3. Domain dataset for domain model (in vs out)
     print("[DEBUG] Loading domain training data...")
     domain_train_ds = DomainDataset(
         in_root=path_to_in_domain,
@@ -232,16 +262,17 @@ def learn(path_to_in_domain: str, path_to_out_domain: str):
         transform=train_transform
     )
     domain_loader = _make_dataloader(domain_train_ds, batch_size=32, shuffle=True)
-    print(f"[DEBUG] Domain dataset samples: {len(domain_train_ds)}\n")
+    print(f"[DEBUG] Domain samples: {len(domain_train_ds)}\n")
 
+    # 4. Train domain model
     print("[DEBUG] Training domain model...\n")
-    domain_model = ResNet18Classifier(num_classes=2)
+    domain_model = SmallCNN(num_classes=2)
     _train_model(
-        domain_model,
-        domain_loader,
-        device,
-        num_epochs=25,          # tuned: enough for good domain separation
-        lr=1e-3,
+        model=domain_model,
+        dataloader=domain_loader,
+        device=device,
+        num_epochs=30,          # enough for domain separation
+        lr=0.01,
         weight_decay=1e-4,
         label="Domain Model"
     )
@@ -254,6 +285,7 @@ def learn(path_to_in_domain: str, path_to_out_domain: str):
         "domain_model": domain_model,
         "class_to_idx": class_to_idx,
         "num_classes": num_classes,
+        # Threshold for calling something out-domain
         "domain_threshold": 0.5,
     }
 
@@ -265,10 +297,10 @@ def learn(path_to_in_domain: str, path_to_out_domain: str):
 @torch.no_grad()
 def compute_accuracy(path_to_eval_folder: str, model) -> float:
     device = model["device"]
-    class_model = model["class_model"]
-    domain_model = model["domain_model"]
-    class_to_idx = model["class_to_idx"]
-    threshold = model["domain_threshold"]
+    class_model: nn.Module = model["class_model"]
+    domain_model: nn.Module = model["domain_model"]
+    class_to_idx: Dict[str, int] = model["class_to_idx"]
+    threshold: float = model["domain_threshold"]
 
     eval_transform = _get_eval_transform()
 
@@ -282,6 +314,8 @@ def compute_accuracy(path_to_eval_folder: str, model) -> float:
 
     eval_loader = _make_dataloader(eval_ds, batch_size=32, shuffle=False)
 
+    class_model.to(device)
+    domain_model.to(device)
     class_model.eval()
     domain_model.eval()
 
@@ -292,16 +326,16 @@ def compute_accuracy(path_to_eval_folder: str, model) -> float:
         images = images.to(device)
         labels = labels.to(device)
 
-        # Domain prediction
+        # Domain prediction (in vs out)
         domain_logits = domain_model(images)
         domain_probs = torch.softmax(domain_logits, dim=1)
-        p_out = domain_probs[:, 1]
+        p_out = domain_probs[:, 1]  # probability of out-domain
 
         # Class prediction
         class_logits = class_model(images)
         preds = torch.argmax(class_logits, dim=1)
 
-        # Override suspected out-domain samples
+        # Override predictions for suspected out-domain samples
         preds[p_out > threshold] = 0
 
         correct += (preds == labels).sum().item()
